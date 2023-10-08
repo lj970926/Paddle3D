@@ -145,11 +145,29 @@ class BEVFFasterRCNN(MVXFasterRCNN):
                 for param in self.lift_splat_shot_vis.parameters():
                     param.trainable = False
 
-    def extract_pts_feat(self, pts, img_feats, img_metas):
+    def extract_pts_feat(self, pts, img_feats, img_metas, voxels, coors,
+                         num_points_per_voxel):
         """Extract features of points."""
         if not self.with_pts_backbone:
             return None
-        voxels, coors, num_points = self.pts_voxel_layer(pts)
+        if not self.training or voxels is None:
+            voxels, coors, num_points = self.pts_voxel_layer(pts)
+        else:
+            voxels = paddle.concat(voxels, axis=0)
+            batch_coors = []
+            for bs_idx, coor in enumerate(coors):
+                coor = coor.reshape([1, -1, 3])
+                coor_dtype = coor.dtype
+                coor = coor.cast("float32")
+                coor_pad = F.pad(coor, [1, 0],
+                                 value=bs_idx,
+                                 mode='constant',
+                                 data_format="NCL")
+                coor_pad = coor_pad.reshape([-1, 4])
+                coor_pad = coor_pad.cast(coor_dtype)
+                batch_coors.append(coor_pad)
+            coors = paddle.concat(batch_coors, axis=0)
+            num_points = paddle.concat(num_points_per_voxel, axis=0)
 
         voxel_features = self.pts_voxel_encoder(voxels, num_points, coors,
                                                 img_feats, img_metas)
@@ -161,10 +179,18 @@ class BEVFFasterRCNN(MVXFasterRCNN):
 
         return [x]
 
-    def extract_feat(self, points, img, img_metas, gt_bboxes_3d=None):
+    def extract_feat(self,
+                     points,
+                     img,
+                     img_metas,
+                     gt_bboxes_3d=None,
+                     voxels=None,
+                     coords=None,
+                     num_points_per_voxel=None):
         """Extract features from images and points."""
         img_feats = self.extract_img_feat(img, img_metas)
-        pts_feats = self.extract_pts_feat(points, img_feats, img_metas)
+        pts_feats = self.extract_pts_feat(points, img_feats, img_metas, voxels,
+                                          coords, num_points_per_voxel)
 
         if self.lift:
             BN, C, H, W = img_feats[0].shape
@@ -187,13 +213,13 @@ class BEVFFasterRCNN(MVXFasterRCNN):
             rots = paddle.stack(rots)
             trans = paddle.stack(trans)
             lidar2img_rt = img_metas[sample_idx]['lidar2img']
-
             img_bev_feat, depth_dist = self.lift_splat_shot_vis(
                 img_feats_view,
                 rots,
                 trans,
                 lidar2img_rt=lidar2img_rt,
                 img_metas=img_metas)
+
             if pts_feats is None:
                 pts_feats = [img_bev_feat]
             else:
@@ -268,11 +294,18 @@ class BEVFFasterRCNN(MVXFasterRCNN):
             gt_labels_3d = sample['gt_labels_3d']
             points = sample.get('points', None)
             img_depth = sample.get('img_depth', None)
+            voxels = sample.get('voxels', None)
+            coords = sample.get('coords', None)
+            num_points_per_voxel = sample.get('num_points_per_voxel', None)
 
-        feature_dict = self.extract_feat(points,
-                                         img=img,
-                                         img_metas=img_metas,
-                                         gt_bboxes_3d=gt_bboxes_3d)
+        feature_dict = self.extract_feat(
+            points,
+            img=img,
+            img_metas=img_metas,
+            gt_bboxes_3d=gt_bboxes_3d,
+            voxels=voxels,
+            coords=coords,
+            num_points_per_voxel=num_points_per_voxel)
         img_feats = feature_dict['img_feats']
         pts_feats = feature_dict['pts_feats']
         depth_dist = feature_dict['depth_dist']
@@ -330,8 +363,9 @@ class BEVFFasterRCNN(MVXFasterRCNN):
 
     def export(self, save_dir, **kwargs):
         self.forward = self.export_forward
-        self.pts_middle_encoder.export_model = True
-        self.lift_splat_shot_vis = True
+        if hasattr(self, "pts_middle_encoder") and self.pts_middle_encoder:
+            self.pts_middle_encoder.export_model = True
+        self.lift_splat_shot_vis.export_model = True
         img_spec = paddle.static.InputSpec(shape=[1 * 6, 3, 448, 800],
                                            dtype='float32',
                                            name='img')

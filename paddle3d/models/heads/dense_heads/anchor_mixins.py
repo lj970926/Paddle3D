@@ -137,16 +137,15 @@ class AnchorTrainMixin(object):
 
         (all_labels, all_label_weights, all_bbox_targets, all_bbox_weights,
          all_dir_targets, all_dir_weights, pos_inds_list,
-         neg_inds_list) = multi_apply(
-             self.anchor_target_3d_single,
-             anchor_list,
-             gt_bboxes_list,
-             gt_bboxes_ignore_list,
-             gt_labels_list,
-             input_metas,
-             label_channels=label_channels,
-             num_classes=num_classes,
-             sampling=sampling)
+         neg_inds_list) = multi_apply(self.anchor_target_3d_single,
+                                      anchor_list,
+                                      gt_bboxes_list,
+                                      gt_bboxes_ignore_list,
+                                      gt_labels_list,
+                                      input_metas,
+                                      label_channels=label_channels,
+                                      num_classes=num_classes,
+                                      sampling=sampling)
 
         # no valid anchors
         if any([labels is None for labels in all_labels]):
@@ -235,16 +234,16 @@ class AnchorTrainMixin(object):
                 total_neg_inds.append(neg_inds)
 
             total_labels = paddle.concat(total_labels, axis=-2).reshape([-1])
-            total_label_weights = paddle.concat(
-                total_label_weights, axis=-2).reshape([-1])
+            total_label_weights = paddle.concat(total_label_weights,
+                                                axis=-2).reshape([-1])
             total_bbox_targets = paddle.concat(
                 total_bbox_targets, axis=-3).reshape([-1, anchors.shape[-1]])
             total_bbox_weights = paddle.concat(
                 total_bbox_weights, axis=-3).reshape([-1, anchors.shape[-1]])
-            total_dir_targets = paddle.concat(
-                total_dir_targets, axis=-2).reshape([-1])
-            total_dir_weights = paddle.concat(
-                total_dir_weights, axis=-2).reshape([-1])
+            total_dir_targets = paddle.concat(total_dir_targets,
+                                              axis=-2).reshape([-1])
+            total_dir_weights = paddle.concat(total_dir_weights,
+                                              axis=-2).reshape([-1])
             total_pos_inds = paddle.concat(total_pos_inds, axis=0).reshape([-1])
             total_neg_inds = paddle.concat(total_neg_inds, axis=0).reshape([-1])
             return (total_labels, total_label_weights, total_bbox_targets,
@@ -297,9 +296,11 @@ class AnchorTrainMixin(object):
                     total_bbox_weights, total_dir_targets, total_dir_weights,
                     total_pos_inds, total_neg_inds)
         else:
-            return self.anchor_target_single_assigner(
-                self.bbox_assigner, anchors, gt_bboxes, gt_bboxes_ignore,
-                gt_labels, input_meta, num_classes, sampling)
+            return self.anchor_target_single_assigner(self.bbox_assigner,
+                                                      anchors, gt_bboxes,
+                                                      gt_bboxes_ignore,
+                                                      gt_labels, input_meta,
+                                                      num_classes, sampling)
 
     def anchor_target_single_assigner(self,
                                       bbox_assigner,
@@ -333,7 +334,8 @@ class AnchorTrainMixin(object):
         dir_weights = paddle.zeros([anchors.shape[0]], dtype='float32')
         labels = paddle.zeros([num_valid_anchors], dtype='int64')
         label_weights = paddle.zeros([num_valid_anchors], dtype='float32')
-        if len(gt_bboxes) > 0:
+        #if len(gt_bboxes) > 0:
+        if gt_bboxes.shape[0] > 0:
             assign_result = bbox_assigner.assign(anchors, gt_bboxes,
                                                  gt_bboxes_ignore, gt_labels)
             sampling_result = self.bbox_sampler.sample(assign_result, anchors,
@@ -341,48 +343,67 @@ class AnchorTrainMixin(object):
             pos_inds = sampling_result.pos_inds
             neg_inds = sampling_result.neg_inds
         else:
-            pos_inds = paddle.nonzero(
-                paddle.zeros([
-                    anchors.shape[0],
-                ], dtype='bool') > 0,
-                as_tuple=False).squeeze(-1).unique()
-            neg_inds = paddle.nonzero(
-                paddle.zeros([
-                    anchors.shape[0],
-                ], dtype='bool') == 0,
-                as_tuple=False).squeeze(-1).unique()
+            pos_inds = paddle.nonzero(paddle.zeros([
+                anchors.shape[0],
+            ],
+                                                   dtype='bool') > 0,
+                                      as_tuple=False).squeeze(-1).unique()
+            neg_inds = paddle.nonzero(paddle.zeros([
+                anchors.shape[0],
+            ],
+                                                   dtype='bool') == 0,
+                                      as_tuple=False).squeeze(-1).unique()
 
         if gt_labels is not None:
             labels += num_classes
-        if len(pos_inds) > 0:
+        #if len(pos_inds) > 0:
+        if pos_inds.numel() > 0:
             pos_bbox_targets = self.bbox_coder.encode(
                 sampling_result.pos_bboxes, sampling_result.pos_gt_bboxes)
-            pos_dir_targets = get_direction_target(
-                sampling_result.pos_bboxes,
-                pos_bbox_targets,
-                self.dir_offset,
-                one_hot=False)
-            bbox_targets[pos_inds, :] = pos_bbox_targets
-            bbox_weights[pos_inds, :] = 1.0
-            dir_targets[pos_inds] = pos_dir_targets
-            dir_weights[pos_inds] = 1.0
+            pos_dir_targets = get_direction_target(sampling_result.pos_bboxes,
+                                                   pos_bbox_targets,
+                                                   self.dir_offset,
+                                                   one_hot=False)
+            #bbox_targets[pos_inds, :] = pos_bbox_targets
+            bbox_targets = paddle.scatter(bbox_targets, pos_inds,
+                                          pos_bbox_targets)
+            #bbox_weights[pos_inds, :] = 1.0
+            bbox_weights = paddle.scatter(
+                bbox_weights, pos_inds,
+                paddle.ones([pos_inds.numel(), bbox_weights.shape[1]],
+                            dtype="float32"))
+            #dir_targets[pos_inds] = pos_dir_targets
+            #dir_weights[pos_inds] = 1.0
+            dir_targets = paddle.scatter(dir_targets, pos_inds, pos_dir_targets)
+            dir_weights = paddle.scatter(
+                dir_weights, pos_inds,
+                paddle.ones_like(pos_inds, dtype="float32"))
 
             if gt_labels is None:
                 labels[pos_inds] = 1
             else:
-                labels[pos_inds] = gt_labels[
-                    sampling_result.pos_assigned_gt_inds]
+                #labels[pos_inds] = gt_labels[
+                #    sampling_result.pos_assigned_gt_inds]
+                labels = paddle.scatter(
+                    labels, pos_inds,
+                    gt_labels[sampling_result.pos_assigned_gt_inds])
             if self.train_cfg['pos_weight'] <= 0:
-                label_weights[pos_inds] = 1.0
+                #label_weights[pos_inds] = 1.0
+                label_weights = paddle.scatter(
+                    label_weights, pos_inds,
+                    paddle.ones_like(pos_inds, dtype="float32"))
             else:
-                label_weights[pos_inds] = self.train_cfg['pos_weight']
+                #label_weights[pos_inds] = self.train_cfg['pos_weight']
+                label_weights = paddle.scatter(
+                    label_weights, pos_inds,
+                    paddle.full_like(pos_inds, self.train_cfg['pos_weight']))
 
-        if len(neg_inds) > 0:
+        if neg_inds.numel() > 0:
             # FIXME: label_weights[neg_inds] = 1.0 is too slow.
             label_weights_np = label_weights.numpy()
             label_weights_np[neg_inds.numpy()] = 1.0
             label_weights = paddle.to_tensor(label_weights_np)
-            # label_weights = paddle.scatter(label_weights, neg_inds, paddle.ones())
+            # label_weights = paddle.scatter(label_weights, neg_inds, paddle.ones_like(neg_inds, dtype="float32"))
         return (labels, label_weights, bbox_targets, bbox_weights, dir_targets,
                 dir_weights, pos_inds, neg_inds)
 
@@ -406,8 +427,8 @@ def get_direction_target(anchors,
     """
     rot_gt = reg_targets[..., 6] + anchors[..., 6]
     offset_rot = limit_period(rot_gt - dir_offset, 0, 2 * np.pi)
-    dir_cls_targets = paddle.floor(
-        offset_rot / (2 * np.pi / num_bins)).astype('int64')
+    dir_cls_targets = paddle.floor(offset_rot /
+                                   (2 * np.pi / num_bins)).astype('int64')
     dir_cls_targets = paddle.clip(dir_cls_targets, min=0, max=num_bins - 1)
     if one_hot:
         raise NotImplementedError

@@ -126,6 +126,118 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
+class WindowAttentionXPU(nn.Layer):
+
+    def __init__(self,
+                 dim,
+                 window_size,
+                 num_heads,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 attn_drop=0.,
+                 proj_drop=0.):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        # define a parameter table of relative position bias
+        # 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table = self.create_parameter(
+            shape=[(2 * window_size[0] - 1) * (2 * window_size[1] - 1),
+                   num_heads],
+            default_initializer=zeros_)
+        self.add_parameter("relative_position_bias_table",
+                           self.relative_position_bias_table)
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = paddle.arange(self.window_size[0])
+        coords_w = paddle.arange(self.window_size[1])
+        coords = paddle.stack(paddle.meshgrid([coords_h,
+                                               coords_w]))  # 2, Wh, Ww
+        coords_flatten = paddle.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten.unsqueeze(
+            2) - coords_flatten.unsqueeze(1)  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.transpose([1, 2,
+                                                     0])  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :,
+                        0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias_attr=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table)
+        self.softmax = nn.Softmax(axis=-1)
+
+    def eval(self):
+        # this is used to re-param swin for model export
+        relative_position_bias_table = self.relative_position_bias_table
+        window_size = self.window_size
+        index = self.relative_position_index.reshape([-1])
+
+        relative_position_bias = paddle.index_select(
+            relative_position_bias_table, index)
+        relative_position_bias = relative_position_bias.reshape([
+            window_size[0] * window_size[1], window_size[0] * window_size[1], -1
+        ])  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.transpose(
+            [2, 0, 1])  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = relative_position_bias.unsqueeze(0)
+        self.register_buffer("relative_position_bias", relative_position_bias)
+
+    def forward(self, x, mask=None):
+        """ Forward function.
+
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        qkv = self.qkv(x)
+
+        if not hasattr(self, "relative_position_bias"):
+            index = self.relative_position_index.reshape([-1])
+
+            relative_position_bias = paddle.index_select(
+                self.relative_position_bias_table, index)
+            relative_position_bias = relative_position_bias.reshape([
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1], -1
+            ])  # Wh*Ww,Wh*Ww,nH
+
+            relative_position_bias = relative_position_bias.transpose(
+                [2, 0, 1])  # nH, Wh*Ww, Wh*Ww
+            self.relative_position_bias = relative_position_bias.unsqueeze(
+                0).expand([B_, self.num_heads, N, N])
+
+        attn_mask = self.relative_position_bias
+
+        if mask is not None:
+            if not hasattr(self, "mask"):
+                nW = mask.shape[0]
+                self.mask = mask.unsqueeze(1).unsqueeze(0).expand(
+                    [B_ // nW, nW, self.num_heads, N,
+                     N]).reshape([-1, self.num_heads, N, N])
+            attn_mask += self.mask
+
+        from xpu_window_attention import xpu_window_attention
+        x = xpu_window_attention(qkv, attn_mask, self.num_heads,
+                                 C // self.num_heads)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
 class WindowAttention(nn.Layer):
     """ Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
@@ -220,9 +332,11 @@ class WindowAttention(nn.Layer):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = q * self.scale
-        attn = paddle.mm(q, k.transpose([0, 1, 3, 2]))
+        attn = paddle.matmul(q, k, transpose_y=True)
+        #attn = paddle.mm(q, k.transpose([0, 1, 3, 2]))
 
-        if self.training or not hasattr(self, "relative_position_bias"):
+        #if self.training or not hasattr(self, "relative_position_bias"):
+        if not hasattr(self, "relative_position_bias"):
             index = self.relative_position_index.reshape([-1])
 
             relative_position_bias = paddle.index_select(
@@ -234,6 +348,7 @@ class WindowAttention(nn.Layer):
 
             relative_position_bias = relative_position_bias.transpose(
                 [2, 0, 1])  # nH, Wh*Ww, Wh*Ww
+            self.relative_position_bias = relative_position_bias.unsqueeze(0)
             attn = attn + relative_position_bias.unsqueeze(0)
         else:
             attn = attn + self.relative_position_bias
@@ -249,7 +364,7 @@ class WindowAttention(nn.Layer):
 
         attn = self.attn_drop(attn)
 
-        x = paddle.mm(attn, v).transpose([0, 2, 1, 3]).reshape([B_, N, C])
+        x = paddle.matmul(attn, v).transpose([0, 2, 1, 3]).reshape([B_, N, C])
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -295,24 +410,22 @@ class SwinTransformerBlock(nn.Layer):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim,
-            window_size=to_2tuple(self.window_size),
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            attn_drop=attn_drop,
-            proj_drop=drop)
+        self.attn = WindowAttention(dim,
+                                    window_size=to_2tuple(self.window_size),
+                                    num_heads=num_heads,
+                                    qkv_bias=qkv_bias,
+                                    qk_scale=qk_scale,
+                                    attn_drop=attn_drop,
+                                    proj_drop=drop)
 
         self.drop_path = DropPath(
             drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            drop=drop)
+        self.mlp = Mlp(in_features=dim,
+                       hidden_features=mlp_hidden_dim,
+                       act_layer=act_layer,
+                       drop=drop)
 
         self.H = None
         self.W = None
@@ -337,14 +450,15 @@ class SwinTransformerBlock(nn.Layer):
         pad_l = pad_t = 0
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(
-            x, (0, 0, pad_t, pad_b, pad_l, pad_r, 0, 0), data_format='NHWC')
+        x = F.pad(x, (0, 0, pad_t, pad_b, pad_l, pad_r, 0, 0),
+                  data_format='NHWC')
         _, Hp, Wp, _ = x.shape
 
         # cyclic shift
         if self.shift_size > 0:
-            shifted_x = paddle.roll(
-                x, shifts=(-self.shift_size, -self.shift_size), axis=(1, 2))
+            shifted_x = paddle.roll(x,
+                                    shifts=(-self.shift_size, -self.shift_size),
+                                    axis=(1, 2))
             attn_mask = mask_matrix
         else:
             shifted_x = x
@@ -369,10 +483,9 @@ class SwinTransformerBlock(nn.Layer):
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            x = paddle.roll(
-                shifted_x,
-                shifts=(self.shift_size, self.shift_size),
-                axis=(1, 2))
+            x = paddle.roll(shifted_x,
+                            shifts=(self.shift_size, self.shift_size),
+                            axis=(1, 2))
         else:
             x = shifted_x
 
@@ -470,19 +583,19 @@ class BasicLayer(nn.Layer):
 
         # build blocks
         self.blocks = nn.LayerList([
-            SwinTransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else window_size // 2,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                qk_scale=qk_scale,
-                drop=drop,
-                attn_drop=attn_drop,
-                drop_path=drop_path[i]
-                if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer) for i in range(depth)
+            SwinTransformerBlock(dim=dim,
+                                 num_heads=num_heads,
+                                 window_size=window_size,
+                                 shift_size=0 if
+                                 (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias,
+                                 qk_scale=qk_scale,
+                                 drop=drop,
+                                 attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(
+                                     drop_path, list) else drop_path,
+                                 norm_layer=norm_layer) for i in range(depth)
         ])
 
         # patch merging layer
@@ -500,21 +613,24 @@ class BasicLayer(nn.Layer):
         """
 
         # calculate attention mask for SW-MSA
-        Hp = int(np.ceil(H / self.window_size)) * self.window_size
-        Wp = int(np.ceil(W / self.window_size)) * self.window_size
-        img_mask = paddle.zeros([1, Hp, Wp, 1])  # 1 Hp Wp 1
-        h_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        w_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        cnt = 0
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[:, h, w, :] = cnt
-                cnt += 1
-
+        if not hasattr(self, "img_mask"):
+            Hp = int(np.ceil(H / self.window_size)) * self.window_size
+            Wp = int(np.ceil(W / self.window_size)) * self.window_size
+            img_mask = paddle.zeros([1, Hp, Wp, 1])  # 1 Hp Wp 1
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size,
+                              -self.shift_size), slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size,
+                              -self.shift_size), slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            self.img_mask = img_mask
+        else:
+            img_mask = self.img_mask
         mask_windows = window_partition(
             img_mask, self.window_size)  # nW, window_size, window_size, 1
         mask_windows = mask_windows.reshape(
@@ -552,8 +668,10 @@ class PatchEmbed(nn.Layer):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2D(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2D(in_chans,
+                              embed_dim,
+                              kernel_size=patch_size,
+                              stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -564,15 +682,13 @@ class PatchEmbed(nn.Layer):
         # padding
         _, _, H, W = x.shape
         if W % self.patch_size[1] != 0:
-            x = F.pad(
-                x, (0, 0, 0, 0, 0, 0, 0,
-                    self.patch_size[1] - W % self.patch_size[1]),
-                data_format="NCHW")
+            x = F.pad(x, (0, 0, 0, 0, 0, 0, 0,
+                          self.patch_size[1] - W % self.patch_size[1]),
+                      data_format="NCHW")
         if H % self.patch_size[0] != 0:
-            x = F.pad(
-                x, (0, 0, 0, 0, 0, self.patch_size[0] - H % self.patch_size[0],
-                    0, 0),
-                data_format="NCHW")
+            x = F.pad(x, (0, 0, 0, 0, 0,
+                          self.patch_size[0] - H % self.patch_size[0], 0, 0),
+                      data_format="NCHW")
 
         x = self.proj(x)  # B C Wh Ww
         if self.norm is not None:
@@ -728,6 +844,7 @@ class SwinTransformer(nn.Layer):
                     param.trainable = False
 
     def init_weights(self, pretrained=None):
+
         def _init_weights(m):
             if isinstance(m, nn.Linear):
                 trunc_normal_(m.weight)
@@ -748,11 +865,10 @@ class SwinTransformer(nn.Layer):
         Wh, Ww = x.shape[2], x.shape[3]
         if self.ape:
             # interpolate the position embedding to the corresponding size
-            absolute_pos_embed = F.interpolate(
-                self.absolute_pos_embed,
-                size=(Wh, Ww),
-                mode='bicubic',
-                data_format="NCHW")
+            absolute_pos_embed = F.interpolate(self.absolute_pos_embed,
+                                               size=(Wh, Ww),
+                                               mode='bicubic',
+                                               data_format="NCHW")
             x = (x + absolute_pos_embed).flatten(2).transpose([0, 2,
                                                                1])  # B Wh*Ww C
         else:
@@ -768,8 +884,8 @@ class SwinTransformer(nn.Layer):
                 norm_layer = getattr(self, f'norm{i}')
                 x_out = norm_layer(x_out)
 
-                out = x_out.reshape([-1, H, W, self.num_features[i]]).transpose(
-                    [0, 3, 1, 2])
+                out = x_out.reshape([-1, H, W, self.num_features[i]
+                                     ]).transpose([0, 3, 1, 2])
                 outs.append(out)
 
         return tuple(outs)

@@ -29,6 +29,7 @@ __all__ = [
 
 
 class NormalCustom(Normal):
+
     def __init__(self, loc, scale, name=None):
         super(NormalCustom, self).__init__(loc, scale, name)
 
@@ -48,14 +49,14 @@ def generate_guassian_depth_target(depth,
     kernel_size = stride
     H = tH // stride
     W = tW // stride
-    unfold_depth = F.unfold(
-        depth.unsqueeze(1),
-        kernel_size,
-        dilations=1,
-        paddings=0,
-        strides=stride)  #B, Cxkxk, HxW
-    unfold_depth = unfold_depth.reshape([B, -1, H, W]).transpose(
-        [0, 2, 3, 1])  # B, H, W, kxk
+    unfold_depth = F.unfold(depth.unsqueeze(1),
+                            kernel_size,
+                            dilations=1,
+                            paddings=0,
+                            strides=stride)  #B, Cxkxk, HxW
+    unfold_depth = unfold_depth.reshape([B, -1, H,
+                                         W]).transpose([0, 2, 3,
+                                                        1])  # B, H, W, kxk
     valid_mask = (unfold_depth != 0)  # BN, H, W, kxk
 
     valid_mask_f = valid_mask.astype('float32')  # BN, H, W, kxk
@@ -232,7 +233,7 @@ def box3d_multiclass_nms(mlvl_bboxes,
         order = _scores.argsort(0, descending=True)
         _bboxes_for_nms = paddle.gather(_bboxes_for_nms, index=order)
 
-        keep, num_out = iou3d_nms.nms_gpu(_bboxes_for_nms, cfg['nms_thr'])
+        keep, num_out = iou3d_nms.nms_xpu(_bboxes_for_nms, cfg['nms_thr'])
         selected = order[keep[:num_out]]
         _mlvl_bboxes = paddle.gather(mlvl_bboxes, cls_inds)
         bboxes.append(paddle.gather(_mlvl_bboxes, selected))

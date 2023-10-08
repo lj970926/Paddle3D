@@ -1,4 +1,4 @@
-batch_size: 1 # 8 gpu, total bs=16
+batch_size: 2 # 8 gpu, total bs=16
 epochs: 12
 
 train_dataset:
@@ -39,8 +39,13 @@ train_dataset:
       to_rgb: true
     - type: PadImage
       size_divisor: 32
+    - type: BevHardVoxelize
+      point_cloud_range: [-50., -50., -5., 50., 50., 3.]
+      voxel_size: [0.25, 0.25, 8.]
+      max_voxel_num: 30000
+      max_points_in_voxel: 64
     - type: SampleFilterByKey
-      keys: ['img', 'img_depth', 'points', 'gt_bboxes_3d', 'gt_labels_3d']
+      keys: ['img', 'img_depth', 'points', 'gt_bboxes_3d', 'gt_labels_3d', 'voxels', 'coords', 'num_points_per_voxel']
   mode: train
 
 val_dataset:

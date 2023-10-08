@@ -305,14 +305,16 @@ class LiftSplatShoot(nn.Layer):
              points[:, :, :, :, :, 2:3]),
             axis=5)
         # TODO(liuxiao): this hacky way to make 7-dim tensor matmul fast
-        points = points.reshape([B, N, D, H, W, 3, 1])
-        points = points.reshape([-1, 3, 1])
-        rots = rots.reshape([B, N, 1, 1, 1, 3,
-                             3]).reshape([B * N, 1, 1, 1, 3, 3])
-        rots = rots.expand([-1, D, H, W, -1, -1]).reshape([-1, 3, 3])
-
-        points = paddle.matmul(rots, points).reshape([B, N, D, H, W, 3])
-        points += trans.reshape([B, N, 1, 1, 1, 3])
+        # points = points.reshape([-1, 1, 3]).expand([-1, 3, 3]).reshape([-1, 3])
+        # points = points * rots.reshape([-1, 1, 1, 1, 3, 3]).expand([-1, D, H ,W, 3, 3]).reshape([-1, 3])
+        # points = points.sum(axis=1).reshape([B, N ,D, H, W, 3])
+        # points = points.reshape([B, N, D, H, W, 3, 1])
+        # points = points.reshape([-1, 3, 1])
+        # rots = rots.reshape([B, N, 1, 1, 1, 3,
+        #                     3]).reshape([B * N, 1, 1, 1, 3, 3])
+        # rots = rots.expand([-1, D, H, W, -1, -1]).reshape([-1, 3, 3])
+        # points = paddle.matmul(rots, points).reshape([B, N, D, H, W, 3])
+        # points += trans.reshape([B, N, 1, 1, 1, 3])
 
         return points
 
@@ -355,6 +357,10 @@ class LiftSplatShoot(nn.Layer):
                 + geom_feats[:, 1] * (self.nx[2] * B) \
                 + geom_feats[:, 2] * B \
                 + geom_feats[:, 3]
+        # ranks = geom_feats[:, 3] * (self.nx[2] * self.nx[0] * self.nx[1]) \
+        #              + geom_feats[:, 2] * (self.nx[0] * self.nx[1]) \
+        #              + geom_feats[:, 0] * self.nx[1] \
+        #              + geom_feats[:, 1]
         sorts = ranks.argsort()
         # x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
         x, geom_feats, ranks = paddle.index_select(
@@ -385,7 +391,7 @@ class LiftSplatShoot(nn.Layer):
 
         return final
 
-    def voxel_pooling_xpu(self, geom_feats, x):
+    def voxel_pooling_xpu(self, geom_feats, x, rots, trans):
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
@@ -393,8 +399,17 @@ class LiftSplatShoot(nn.Layer):
         x = x.reshape([Nprime, C])
 
         # flatten indices
+        #obtain origin of lidar coords in the camera coords
+        # origin_lidar = (self.bx - self.dx / 2.0).reshape([3, 1])
+        # origin_lidar_img = paddle.matmul(rots, origin_lidar).reshape([B, N, 1, 1, 1, 3])
+        # origin_lidar_img += trans.reshape([B, N, 1, 1, 1, 3])
+        # origin_lidar_img = paddle.expand(origin_lidar_img, [B, N, D, H, W, 3])
         geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) /
                       self.dx).astype('int64')
+        # scale_factor = paddle.linalg.det(rots).reshape([B, N, 1])
+        # scale_factor = paddle.pow(scale_factor, 1.0 / 3)
+        # dx = (self.dx * scale_factor).reshape([B, N, 1, 1, 1, 3])
+        # geom_feats = ((geom_feats - origin_lidar_img) / dx).astype('int64')
         geom_feats = geom_feats.reshape([Nprime, 3])
         batch_ix = paddle.concat([
             paddle.full([Nprime // B, 1], ix, dtype='int64') for ix in range(B)
@@ -451,10 +466,12 @@ class LiftSplatShoot(nn.Layer):
                    post_trans=None):
         geom = self.get_geometry(rots, trans, post_rots, post_trans)
         x, depth = self.get_cam_feats(x)
-        if paddle.is_compiled_with_xpu():
-            x = self.voxel_pooling_xpu(geom, x)
-        else:
-            x = self.voxel_pooling(geom, x)
+        x = self.voxel_pooling_fusion(x, geom, rots, trans)
+        # if paddle.is_compiled_with_xpu():
+        #     x = self.voxel_pooling_xpu(geom, x, rots, trans)
+        # else:
+        #     x = self.voxel_pooling(geom, x)
+        # x = self.voxel_pooling(geom, x)
         return x, depth
 
     def s2c(self, x):
@@ -478,3 +495,16 @@ class LiftSplatShoot(nn.Layer):
         bev = self.s2c(x)
         x = self.bevencode(bev)
         return x, depth
+
+    def voxel_pooling_fusion(self, x, geom, rots, trans):
+        B = x.shape[0]
+        C = x.shape[5]
+        bx = self.bx - self.dx / 2.0
+        dx = self.dx
+        nx = self.nx
+        from xpu_voxel_pooling import xpu_voxel_pooling
+        out, _ = xpu_voxel_pooling(x, geom, rots, trans, bx.tolist(),
+                                   dx.tolist(), nx)
+        out = out.reshape([B, nx[2], nx[0], nx[1],
+                           C]).transpose([0, 4, 1, 2, 3])
+        return out

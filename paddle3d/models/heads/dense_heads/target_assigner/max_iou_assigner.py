@@ -67,8 +67,9 @@ class BboxOverlapsNearest3D(object):
 
 
 def nearest_bev(bboxes):
-    bev_rotated_boxes = paddle.gather(
-        bboxes, paddle.to_tensor([0, 1, 3, 4, 6]), axis=1)
+    bev_rotated_boxes = paddle.gather(bboxes,
+                                      paddle.to_tensor([0, 1, 3, 4, 6]),
+                                      axis=1)
     # convert the rotation to a valid range
     rotations = bev_rotated_boxes[:, -1]
     normed_rotations = paddle.abs(limit_period(rotations, 0.5, np.pi))
@@ -77,9 +78,8 @@ def nearest_bev(bboxes):
     conditions = (normed_rotations > np.pi / 4)[..., None]
     bboxes_xywh = paddle.where(
         conditions,
-        paddle.gather(
-            bev_rotated_boxes, paddle.to_tensor([0, 1, 3, 2]), axis=1),
-        bev_rotated_boxes[:, :4])
+        paddle.gather(bev_rotated_boxes, paddle.to_tensor([0, 1, 3, 2]),
+                      axis=1), bev_rotated_boxes[:, :4])
 
     centers = bboxes_xywh[:, :2]
     dims = bboxes_xywh[:, 2:]
@@ -100,8 +100,10 @@ def bbox_overlaps_nearest_3d(bboxes1,
     bboxes1_bev = nearest_bev(bboxes1)
     bboxes2_bev = nearest_bev(bboxes2)
 
-    ret = bbox_overlaps(
-        bboxes1_bev, bboxes2_bev, mode=mode, is_aligned=is_aligned)
+    ret = bbox_overlaps(bboxes1_bev,
+                        bboxes2_bev,
+                        mode=mode,
+                        is_aligned=is_aligned)
     return ret
 
 
@@ -124,10 +126,10 @@ def bbox_overlaps(bboxes1, bboxes2, mode='iou', is_aligned=False, eps=1e-6):
     if rows * cols == 0:
         raise ValueError("dim is 0")
 
-    area1 = (bboxes1[..., 2] - bboxes1[..., 0]) * (
-        bboxes1[..., 3] - bboxes1[..., 1])
-    area2 = (bboxes2[..., 2] - bboxes2[..., 0]) * (
-        bboxes2[..., 3] - bboxes2[..., 1])
+    area1 = (bboxes1[..., 2] - bboxes1[..., 0]) * (bboxes1[..., 3] -
+                                                   bboxes1[..., 1])
+    area2 = (bboxes2[..., 2] - bboxes2[..., 0]) * (bboxes2[..., 3] -
+                                                   bboxes2[..., 1])
 
     if is_aligned:
         lt = paddle.maximum(bboxes1[..., :2], bboxes2[..., :2])  # [B, rows, 2]
@@ -150,7 +152,8 @@ def bbox_overlaps(bboxes1, bboxes2, mode='iou', is_aligned=False, eps=1e-6):
                             bboxes2[..., None, :, 2:])  # [B, rows, cols, 2]
 
         wh = (rb - lt).clip(min=0)  # [B, rows, cols, 2]
-        overlap = wh[..., 0] * wh[..., 1]
+        wh = wh.transpose([2, 0, 1])
+        overlap = wh[0, ...] * wh[1, ...]
 
         if mode in ['iou', 'giou']:
             union = area1[..., None] + area2[..., None, :] - overlap
@@ -254,12 +257,14 @@ class MaxIoUAssigner(object):
         if (self.ignore_iof_thr > 0 and gt_bboxes_ignore is not None
                 and gt_bboxes_ignore.numel() > 0 and bboxes.numel() > 0):
             if self.ignore_wrt_candidates:
-                ignore_overlaps = self.iou_calculator(
-                    bboxes, gt_bboxes_ignore, mode='iof')
+                ignore_overlaps = self.iou_calculator(bboxes,
+                                                      gt_bboxes_ignore,
+                                                      mode='iof')
                 ignore_max_overlaps = ignore_overlaps.max(axis=1)
             else:
-                ignore_overlaps = self.iou_calculator(
-                    gt_bboxes_ignore, bboxes, mode='iof')
+                ignore_overlaps = self.iou_calculator(gt_bboxes_ignore,
+                                                      bboxes,
+                                                      mode='iof')
                 ignore_max_overlaps = ignore_overlaps.max(axis=0)
             overlaps[:, ignore_max_overlaps > self.ignore_iof_thr] = -1
 
@@ -298,11 +303,10 @@ class MaxIoUAssigner(object):
                 assigned_labels = paddle.full([
                     num_bboxes,
                 ], -1, dtype='int64')
-            return _EasyDict(
-                num_gts=num_gts,
-                gt_inds=assigned_gt_inds,
-                max_overlaps=max_overlaps,
-                labels=assigned_labels)
+            return _EasyDict(num_gts=num_gts,
+                             gt_inds=assigned_gt_inds,
+                             max_overlaps=max_overlaps,
+                             labels=assigned_labels)
 
         # for each anchor, which gt best overlaps with it
         # for each anchor, the max iou of all gts
@@ -313,11 +317,20 @@ class MaxIoUAssigner(object):
         gt_max_overlaps = overlaps.max(axis=1)
         gt_argmax_overlaps = overlaps.argmax(axis=1)
 
+        from xpu_scatter_unique import xpu_scatter_unique
+
         # 2. assign negative: below
         # the negative inds are set to be 0
         if isinstance(self.neg_iou_thr, float):
-            assigned_gt_inds[(max_overlaps >= 0)
-                             & (max_overlaps < self.neg_iou_thr)] = 0
+            #assigned_gt_inds[(max_overlaps >= 0)
+            #                & (max_overlaps < self.neg_iou_thr)] = 0
+            neg_inds = (max_overlaps >= 0) & (max_overlaps < self.neg_iou_thr)
+            neg_inds = paddle.nonzero(neg_inds)
+            assigned_gt_inds = xpu_scatter_unique(
+                assigned_gt_inds, neg_inds,
+                paddle.zeros_like(neg_inds, dtype="int64"))
+            # neg_inds = (max_overlaps < 0) | (max_overlaps >= self.neg_iou_thr)
+            # assigned_gt_inds = assigned_gt_inds * neg_inds
         elif isinstance(self.neg_iou_thr, tuple):
             assert len(self.neg_iou_thr) == 2
             assigned_gt_inds[(max_overlaps >= self.neg_iou_thr[0])
@@ -325,7 +338,10 @@ class MaxIoUAssigner(object):
 
         # 3. assign positive: above positive IoU threshold
         pos_inds = max_overlaps >= self.pos_iou_thr
-        assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1
+        #assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1
+        pos_inds = paddle.nonzero(pos_inds).squeeze()
+        assigned_gt_inds = paddle.scatter(assigned_gt_inds, pos_inds,
+                                          argmax_overlaps[pos_inds] + 1)
 
         if self.match_low_quality:
             # Low-quality matching will overwrite the assigned_gt_inds assigned
@@ -336,35 +352,52 @@ class MaxIoUAssigner(object):
             # However, if GT bbox 2's gt_argmax_overlaps = A, bbox A's
             # assigned_gt_inds will be overwritten to be bbox B.
             # This might be the reason that it is not used in ROI Heads.
-            for i in range(num_gts):
-                if gt_max_overlaps[i] >= self.min_pos_iou:
-                    if self.gt_max_assign_all:
-                        max_iou_inds = overlaps[i, :] == gt_max_overlaps[i]
-                        assigned_gt_inds[max_iou_inds] = i + 1
-                    else:
-                        assigned_gt_inds[gt_argmax_overlaps[i]] = i + 1
+            # for i in range(num_gts):
+            #     if gt_max_overlaps[i] >= self.min_pos_iou:
+            #         if self.gt_max_assign_all:
+            #             max_iou_inds = overlaps[i, :] == gt_max_overlaps[i]
+            #             assigned_gt_inds[max_iou_inds] = i + 1
+            #         else:
+            #             assigned_gt_inds[gt_argmax_overlaps[i]] = i + 1
+            gt_do_assign = gt_max_overlaps >= self.min_pos_iou
+            max_iou_inds = (overlaps == gt_max_overlaps.reshape([-1, 1]))
+            max_iou_inds = max_iou_inds & gt_do_assign.reshape([-1, 1])
+            new_gt_inds = paddle.linspace(
+                1, num_gts, num_gts, dtype="int64").reshape([-1, 1]).expand(
+                    (num_gts, assigned_gt_inds.shape[0]))
+            value = paddle.masked_select(new_gt_inds, max_iou_inds)
+            assign_res = paddle.index_put(
+                paddle.expand(assigned_gt_inds,
+                              (num_gts, assigned_gt_inds.shape[0])),
+                [max_iou_inds], value)
+            assigned_gt_inds = assign_res.max(axis=0)
 
         if gt_labels is not None:
             assigned_labels = paddle.full([
                 num_bboxes,
             ], -1, dtype='int64')
-            pos_inds = paddle.nonzero(
-                assigned_gt_inds > 0, as_tuple=False).squeeze()
+            pos_inds = paddle.nonzero(assigned_gt_inds > 0,
+                                      as_tuple=False).squeeze()
             if pos_inds.numel() > 0:
                 # zero shape tensor
                 if pos_inds.ndim == 0:
                     pos_inds = pos_inds.unsqueeze(-1)
                 try:
-                    assigned_labels[pos_inds] = gt_labels[
-                        assigned_gt_inds[pos_inds] - 1]
+                    #assigned_labels[pos_inds] = gt_labels[
+                    #    assigned_gt_inds[pos_inds] - 1]
+                    assigned_labels = xpu_scatter_unique(
+                        assigned_labels, pos_inds,
+                        gt_labels[assigned_gt_inds[pos_inds] - 1])
                 except:
-                    assigned_labels[pos_inds] = gt_labels[
-                        assigned_gt_inds[pos_inds] - 1]
+                    #assigned_labels[pos_inds] = gt_labels[
+                    #    assigned_gt_inds[pos_inds] - 1]
+                    assigned_labels = xpu_scatter_unique(
+                        assigned_labels, pos_inds,
+                        gt_labels[assigned_gt_inds[pos_inds] - 1])
         else:
             assigned_labels = None
 
-        return _EasyDict(
-            num_gts=num_gts,
-            gt_inds=assigned_gt_inds,
-            max_overlaps=max_overlaps,
-            labels=assigned_labels)
+        return _EasyDict(num_gts=num_gts,
+                         gt_inds=assigned_gt_inds,
+                         max_overlaps=max_overlaps,
+                         labels=assigned_labels)

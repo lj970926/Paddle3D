@@ -82,10 +82,10 @@ class PseudoSampler(object):
         Returns:
             :obj:`SamplingResult`: sampler results
         """
-        pos_inds = paddle.nonzero(
-            assign_result.gt_inds > 0, as_tuple=False).squeeze(-1).unique()
-        neg_inds = paddle.nonzero(
-            assign_result.gt_inds == 0, as_tuple=False).squeeze(-1).unique()
+        pos_inds = paddle.nonzero(assign_result.gt_inds > 0,
+                                  as_tuple=False).squeeze(-1)
+        neg_inds = paddle.nonzero(assign_result.gt_inds == 0,
+                                  as_tuple=False).squeeze(-1)
         gt_flags = paddle.zeros([bboxes.shape[0]], dtype='int32')
         sampling_result = SamplingResult(pos_inds, neg_inds, bboxes, gt_bboxes,
                                          assign_result, gt_flags)
